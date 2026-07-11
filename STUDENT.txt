@@ -1,0 +1,3 @@
+Nama: Wafa Bila Syaefurokhman
+Email: emailkamu@gmail.com
+URL Deployment: https://root-facts-app-wafa.netlify.app
