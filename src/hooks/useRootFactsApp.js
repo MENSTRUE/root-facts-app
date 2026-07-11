@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+} from 'react';
+
 import { useAppState } from './useAppState.js';
 import { CameraService } from '../services/CameraService.js';
 import { DetectionService } from '../services/DetectionService.js';
@@ -7,11 +13,15 @@ import { APP_CONFIG } from '../utils/config.js';
 import { logError } from '../utils/common.js';
 
 /**
- * useRootFactsApp
- * Central hook that owns the three service instances (camera, TF.js
- * detector, Transformers.js generator) and drives the requestAnimationFrame
- * detection loop with FPS throttling, an inference lock, stability-based
- * generation triggering, and full cleanup on unmount.
+ * Central application hook.
+ *
+ * Detection uses a one-shot workflow:
+ *
+ * 1. User starts the camera.
+ * 2. TensorFlow.js searches for a stable vegetable label.
+ * 3. Once stable, the detection loop and webcam are stopped.
+ * 4. Transformers.js generates exactly one fun fact.
+ * 5. The result remains visible until the user starts another scan.
  */
 export function useRootFactsApp() {
   const { state, actions } = useAppState();
@@ -24,194 +34,473 @@ export function useRootFactsApp() {
   const isMountedRef = useRef(true);
   const rafIdRef = useRef(null);
   const isPredictingRef = useRef(false);
+  const isCompletingScanRef = useRef(false);
+
   const lastTickTimeRef = useRef(0);
   const fpsRef = useRef(state.fps);
 
   const stableLabelRef = useRef(null);
   const stableCountRef = useRef(0);
+
   const isGeneratingRef = useRef(false);
   const lastGeneratedLabelRef = useRef(null);
   const lastGenerationTimeRef = useRef(0);
 
   const copyResetTimerRef = useRef(null);
 
-  // Keep the FPS ref in sync so the rAF loop never reads a stale closure value.
   useEffect(() => {
     fpsRef.current = state.fps;
   }, [state.fps]);
 
-  // ---- Online / offline awareness -----------------------------------
+  // ------------------------------------------------------------
+  // Online and offline state
+  // ------------------------------------------------------------
+
   useEffect(() => {
-    const handleOnline = () => actions.setOffline(false);
-    const handleOffline = () => actions.setOffline(true);
+    const handleOnline = () => {
+      actions.setOffline(false);
+    };
+
+    const handleOffline = () => {
+      actions.setOffline(true);
+    };
+
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, [actions]);
 
-  // ---- Fun-fact generation --------------------------------------------
-  const runGeneration = useCallback(async (label, { forced = false } = {}) => {
-    const generator = rootFactsServiceRef.current;
-    if (!generator || !generator.isReady()) return;
-    if (isGeneratingRef.current) return;
+  // ------------------------------------------------------------
+  // Detection-loop controls
+  // ------------------------------------------------------------
 
-    const now = Date.now();
-    const sameAsLastGenerated = label === lastGeneratedLabelRef.current;
-    const cooldownElapsed = now - lastGenerationTimeRef.current >= APP_CONFIG.generationCooldownMs;
-
-    if (!forced && sameAsLastGenerated) return;
-    if (!forced && !cooldownElapsed) return;
-
-    isGeneratingRef.current = true;
-    lastGeneratedLabelRef.current = label;
-    lastGenerationTimeRef.current = now;
-    actions.setFunFactData(null);
-
-    try {
-      const fact = await generator.generateFacts(label);
-      if (!isMountedRef.current) return;
-      actions.setFunFactData(fact);
-    } catch (error) {
-      logError('generateFacts', error);
-      if (!isMountedRef.current) return;
-      actions.setFunFactData('error');
-    } finally {
-      isGeneratingRef.current = false;
+  const stopDetectionLoop = useCallback(() => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
     }
-  }, [actions]);
 
-  // ---- Detection loop ---------------------------------------------------
-  const processDetection = useCallback((result) => {
-    const threshold = APP_CONFIG.detectionConfidenceThreshold;
+    isPredictingRef.current = false;
+  }, []);
 
-    if (result.isValid && result.confidence >= threshold) {
-      if (result.className === stableLabelRef.current) {
-        stableCountRef.current += 1;
-      } else {
-        stableLabelRef.current = result.className;
-        stableCountRef.current = 1;
+  /**
+   * Stops camera and prediction without clearing the detected result.
+   * Used immediately before Generative AI inference.
+   */
+  const finishCameraPhase = useCallback(async () => {
+    stopDetectionLoop();
+
+    const camera = cameraServiceRef.current;
+
+    if (camera) {
+      try {
+        await Promise.resolve(camera.stopCamera());
+      } catch (error) {
+        logError('finishCameraPhase', error);
       }
-    } else {
-      stableLabelRef.current = null;
-      stableCountRef.current = 0;
     }
 
-    actions.setDetectionResult(result);
+    if (isMountedRef.current) {
+      actions.setRunning(false);
+    }
+  }, [actions, stopDetectionLoop]);
 
-    const isStable = stableCountRef.current >= APP_CONFIG.stableFramesRequired;
+  // ------------------------------------------------------------
+  // Fun-fact generation
+  // ------------------------------------------------------------
 
-    if (isStable) {
+  const runGeneration = useCallback(
+    async (label, { forced = false } = {}) => {
+      const generator = rootFactsServiceRef.current;
+
+      if (!generator || !generator.isReady()) {
+        if (isMountedRef.current) {
+          actions.setFunFactData('error');
+        }
+
+        return;
+      }
+
+      if (isGeneratingRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+
+      const sameAsLastGenerated = (
+        label === lastGeneratedLabelRef.current
+      );
+
+      const cooldownElapsed = (
+        now - lastGenerationTimeRef.current
+        >= APP_CONFIG.generationCooldownMs
+      );
+
+      if (!forced && sameAsLastGenerated) {
+        return;
+      }
+
+      if (!forced && !cooldownElapsed) {
+        return;
+      }
+
+      isGeneratingRef.current = true;
+      lastGeneratedLabelRef.current = label;
+      lastGenerationTimeRef.current = now;
+
+      // Null tells the UI that Generative AI is currently loading.
+      actions.setFunFactData(null);
+
+      try {
+        const fact = await generator.generateFacts(label);
+
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        actions.setFunFactData(fact);
+        actions.setAppState('result');
+      } catch (error) {
+        logError('generateFacts', error);
+
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        actions.setFunFactData('error');
+        actions.setAppState('result');
+      } finally {
+        isGeneratingRef.current = false;
+      }
+    },
+    [actions],
+  );
+
+  // ------------------------------------------------------------
+  // Detection processing
+  // ------------------------------------------------------------
+
+  const processDetection = useCallback(
+    async (result) => {
+      if (isCompletingScanRef.current) {
+        return;
+      }
+
+      const threshold = (
+        APP_CONFIG.detectionConfidenceThreshold
+      );
+
+      const isValidResult = (
+        result
+        && result.isValid
+        && result.confidence >= threshold
+      );
+
+      if (isValidResult) {
+        if (
+          result.className
+          === stableLabelRef.current
+        ) {
+          stableCountRef.current += 1;
+        } else {
+          stableLabelRef.current = result.className;
+          stableCountRef.current = 1;
+        }
+      } else {
+        stableLabelRef.current = null;
+        stableCountRef.current = 0;
+      }
+
+      actions.setDetectionResult(result);
+
+      const isStable = (
+        isValidResult
+        && stableCountRef.current
+          >= APP_CONFIG.stableFramesRequired
+      );
+
+      if (!isStable) {
+        actions.setAppState('analyzing');
+        return;
+      }
+
+      // Prevent another camera frame from starting a second generation.
+      isCompletingScanRef.current = true;
+
       actions.setAppState('result');
-      runGeneration(result.className);
-    } else {
-      actions.setAppState('analyzing');
-    }
-  }, [actions, runGeneration]);
+
+      // Reviewer-requested behavior:
+      // stop detection and webcam before Transformers.js inference.
+      await finishCameraPhase();
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
+      // One user scan should always generate one result, even when
+      // the same vegetable was scanned previously.
+      await runGeneration(
+        result.className,
+        { forced: true },
+      );
+    },
+    [
+      actions,
+      finishCameraPhase,
+      runGeneration,
+    ],
+  );
 
   const tick = useCallback(async () => {
     const camera = cameraServiceRef.current;
     const detector = detectionServiceRef.current;
-    if (!camera || !detector) return;
-    if (!camera.isReady() || !detector.isLoaded()) return;
+
+    if (!camera || !detector) {
+      return;
+    }
+
+    if (
+      !camera.isReady()
+      || !detector.isLoaded()
+      || isCompletingScanRef.current
+    ) {
+      return;
+    }
 
     try {
-      const result = await detector.predict(camera.video);
-      if (!isMountedRef.current) return;
-      processDetection(result);
+      const result = await detector.predict(
+        camera.video,
+      );
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
+      await processDetection(result);
     } catch (error) {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current) {
+        return;
+      }
+
       logError('detection tick', error);
     }
   }, [processDetection]);
 
-  const loop = useCallback((timestamp) => {
-    rafIdRef.current = requestAnimationFrame(loop);
+  const loop = useCallback(
+    (timestamp) => {
+      if (
+        !isMountedRef.current
+        || isCompletingScanRef.current
+      ) {
+        rafIdRef.current = null;
+        return;
+      }
 
-    const interval = 1000 / (fpsRef.current || 1);
-    if (timestamp - lastTickTimeRef.current < interval) return;
-    lastTickTimeRef.current = timestamp;
+      rafIdRef.current = requestAnimationFrame(loop);
 
-    if (isPredictingRef.current) return;
-    isPredictingRef.current = true;
-    tick().finally(() => {
-      isPredictingRef.current = false;
-    });
-  }, [tick]);
+      const interval = (
+        1000 / (fpsRef.current || 1)
+      );
 
-  // ---- Camera controls ----------------------------------------------
+      if (
+        timestamp - lastTickTimeRef.current
+        < interval
+      ) {
+        return;
+      }
+
+      lastTickTimeRef.current = timestamp;
+
+      if (isPredictingRef.current) {
+        return;
+      }
+
+      isPredictingRef.current = true;
+
+      tick()
+        .catch((error) => {
+          logError('detection loop', error);
+        })
+        .finally(() => {
+          isPredictingRef.current = false;
+        });
+    },
+    [tick],
+  );
+
+  // ------------------------------------------------------------
+  // Camera controls
+  // ------------------------------------------------------------
+
   const startScanning = useCallback(async () => {
     const camera = cameraServiceRef.current;
-    if (!camera) return;
+
+    if (!camera) {
+      return;
+    }
+
     try {
       actions.setError(null);
-      await camera.startCamera(state.cameraFacing);
-      if (!isMountedRef.current) return;
+
+      // Clear the previous result only when the user explicitly
+      // starts a new scan.
+      actions.resetResults();
 
       stableLabelRef.current = null;
       stableCountRef.current = 0;
+
+      isCompletingScanRef.current = false;
+      isGeneratingRef.current = false;
+      isPredictingRef.current = false;
+
+      lastGeneratedLabelRef.current = null;
+      lastGenerationTimeRef.current = 0;
       lastTickTimeRef.current = 0;
+
+      await camera.startCamera(
+        state.cameraFacing,
+      );
+
+      if (!isMountedRef.current) {
+        return;
+      }
 
       actions.setRunning(true);
       actions.setAppState('analyzing');
 
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = requestAnimationFrame(loop);
-    } catch (error) {
-      if (!isMountedRef.current) return;
-      logError('startScanning', error);
-      actions.setError(error.message || 'Gagal memulai kamera.');
-    }
-  }, [actions, loop, state.cameraFacing]);
+      stopDetectionLoop();
 
-  const stopScanning = useCallback(() => {
-    if (rafIdRef.current) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
+      rafIdRef.current = requestAnimationFrame(
+        loop,
+      );
+    } catch (error) {
+      if (!isMountedRef.current) {
+        return;
+      }
+
+      logError('startScanning', error);
+
+      actions.setError(
+        error.message
+        || 'Gagal memulai kamera.',
+      );
+
+      actions.setRunning(false);
     }
-    isPredictingRef.current = false;
+  }, [
+    actions,
+    loop,
+    state.cameraFacing,
+    stopDetectionLoop,
+  ]);
+
+  /**
+   * Manual stop initiated by the user.
+   * Unlike automatic completion, this clears the current result.
+   */
+  const stopScanning = useCallback(() => {
+    stopDetectionLoop();
+
+    isCompletingScanRef.current = false;
+    stableLabelRef.current = null;
+    stableCountRef.current = 0;
+
     cameraServiceRef.current?.stopCamera();
+
     actions.setRunning(false);
     actions.resetResults();
-  }, [actions]);
+  }, [actions, stopDetectionLoop]);
 
   const toggleCamera = useCallback(() => {
     if (state.isRunning) {
       stopScanning();
-    } else {
-      startScanning();
+      return;
     }
-  }, [state.isRunning, startScanning, stopScanning]);
 
-  const changeCameraFacing = useCallback((facing) => {
-    actions.setCameraFacing(facing);
-    if (state.isRunning && cameraServiceRef.current) {
-      cameraServiceRef.current.startCamera(facing).catch((error) => {
-        logError('changeCameraFacing', error);
-        actions.setError(error.message || 'Gagal mengganti kamera.');
-      });
-    }
-  }, [actions, state.isRunning]);
+    startScanning();
+  }, [
+    state.isRunning,
+    startScanning,
+    stopScanning,
+  ]);
 
-  const changeFps = useCallback((fps) => {
-    actions.setFps(fps);
-    cameraServiceRef.current?.setFPS(fps);
-  }, [actions]);
+  const changeCameraFacing = useCallback(
+    (facing) => {
+      actions.setCameraFacing(facing);
 
-  const changePersona = useCallback((persona) => {
-    actions.setPersona(persona);
-    rootFactsServiceRef.current?.setTone(persona);
-  }, [actions]);
+      if (
+        state.isRunning
+        && cameraServiceRef.current
+        && !isCompletingScanRef.current
+      ) {
+        cameraServiceRef.current
+          .startCamera(facing)
+          .catch((error) => {
+            logError(
+              'changeCameraFacing',
+              error,
+            );
+
+            actions.setError(
+              error.message
+              || 'Gagal mengganti kamera.',
+            );
+          });
+      }
+    },
+    [actions, state.isRunning],
+  );
+
+  const changeFps = useCallback(
+    (fps) => {
+      actions.setFps(fps);
+      fpsRef.current = fps;
+
+      cameraServiceRef.current?.setFPS(fps);
+    },
+    [actions],
+  );
+
+  const changePersona = useCallback(
+    (persona) => {
+      actions.setPersona(persona);
+
+      rootFactsServiceRef.current?.setTone(
+        persona,
+      );
+    },
+    [actions],
+  );
 
   const regenerateFact = useCallback(() => {
-    if (!state.detectionResult) return;
-    runGeneration(state.detectionResult.className, { forced: true });
-  }, [runGeneration, state.detectionResult]);
+    if (!state.detectionResult) {
+      return;
+    }
+
+    runGeneration(
+      state.detectionResult.className,
+      { forced: true },
+    );
+  }, [
+    runGeneration,
+    state.detectionResult,
+  ]);
+
+  // ------------------------------------------------------------
+  // Clipboard
+  // ------------------------------------------------------------
 
   const copyFact = useCallback(async () => {
-    if (!state.funFactData || state.funFactData === 'error') return;
+    if (
+      !state.funFactData
+      || state.funFactData === 'error'
+    ) {
+      return;
+    }
 
     if (copyResetTimerRef.current) {
       clearTimeout(copyResetTimerRef.current);
@@ -219,28 +508,50 @@ export function useRootFactsApp() {
 
     try {
       if (!navigator.clipboard) {
-        throw new Error('Clipboard API tidak tersedia di browser ini.');
+        throw new Error(
+          'Clipboard API tidak tersedia di browser ini.',
+        );
       }
-      await navigator.clipboard.writeText(state.funFactData);
-      if (!isMountedRef.current) return;
+
+      await navigator.clipboard.writeText(
+        state.funFactData,
+      );
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       actions.setCopyStatus('success');
     } catch (error) {
       logError('copyFact', error);
-      if (!isMountedRef.current) return;
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       actions.setCopyStatus('error');
     } finally {
-      copyResetTimerRef.current = setTimeout(() => {
-        if (isMountedRef.current) actions.setCopyStatus(null);
-      }, 2000);
+      copyResetTimerRef.current = setTimeout(
+        () => {
+          if (isMountedRef.current) {
+            actions.setCopyStatus(null);
+          }
+        },
+        2000,
+      );
     }
   }, [actions, state.funFactData]);
 
   const retryLoadModels = useCallback(() => {
     actions.setLoadError(null);
+
     setRetryCount((count) => count + 1);
   }, [actions]);
 
-  // ---- Service instantiation + model loading -------------------------
+  // ------------------------------------------------------------
+  // Service initialization
+  // ------------------------------------------------------------
+
   useEffect(() => {
     isMountedRef.current = true;
 
@@ -260,64 +571,138 @@ export function useRootFactsApp() {
       camera: cameraService,
       generator: rootFactsService,
     });
+
     actions.setServicesReady(false);
     actions.setLoadError(null);
     actions.setLoadProgress(null);
 
-    (async () => {
+    const initializeModels = async () => {
       try {
-        actions.setModelStatus('Menyiapkan backend AI...');
+        actions.setModelStatus(
+          'Menyiapkan backend AI...',
+        );
 
-        actions.setModelStatus('Memuat model deteksi...');
-        const detectionInfo = await detectionService.loadModel({
-          onProgress: ({ progress }) => {
-            if (!isMountedRef.current) return;
-            if (typeof progress === 'number') {
-              actions.setLoadProgress(Math.round(Math.min(progress, 1) * 100));
-            }
-          },
-        });
-        if (!isMountedRef.current) return;
-        actions.setDetectionBackend(detectionInfo.backend);
+        actions.setModelStatus(
+          'Memuat model deteksi...',
+        );
 
-        actions.setModelStatus('Memuat model generatif...');
+        const detectionInfo = (
+          await detectionService.loadModel({
+            onProgress: ({ progress }) => {
+              if (!isMountedRef.current) {
+                return;
+              }
+
+              if (
+                typeof progress === 'number'
+              ) {
+                actions.setLoadProgress(
+                  Math.round(
+                    Math.min(progress, 1) * 100,
+                  ),
+                );
+              }
+            },
+          })
+        );
+
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        actions.setDetectionBackend(
+          detectionInfo.backend,
+        );
+
+        actions.setModelStatus(
+          'Memuat model generatif...',
+        );
+
         actions.setLoadProgress(null);
-        const generationBackend = await rootFactsService.loadModel({
-          onProgress: (data) => {
-            if (!isMountedRef.current) return;
-            if (typeof data.progress === 'number') {
-              actions.setLoadProgress(Math.round(Math.min(data.progress, 100)));
-            }
-          },
-        });
-        if (!isMountedRef.current) return;
-        actions.setGenerationBackend(generationBackend);
 
-        actions.setModelStatus('Model AI Siap');
+        const generationBackend = (
+          await rootFactsService.loadModel({
+            onProgress: (data) => {
+              if (!isMountedRef.current) {
+                return;
+              }
+
+              if (
+                typeof data.progress === 'number'
+              ) {
+                actions.setLoadProgress(
+                  Math.round(
+                    Math.min(
+                      data.progress,
+                      100,
+                    ),
+                  ),
+                );
+              }
+            },
+          })
+        );
+
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        actions.setGenerationBackend(
+          generationBackend,
+        );
+
+        actions.setModelStatus(
+          'Model AI Siap',
+        );
+
         actions.setLoadProgress(100);
         actions.setServicesReady(true);
       } catch (error) {
-        logError('model initialization', error);
-        if (!isMountedRef.current) return;
-        actions.setModelStatus('Gagal memuat model');
-        actions.setLoadError(error.message || 'Terjadi kesalahan saat memuat model AI.');
+        logError(
+          'model initialization',
+          error,
+        );
+
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        actions.setModelStatus(
+          'Gagal memuat model',
+        );
+
+        actions.setLoadError(
+          error.message
+          || 'Terjadi kesalahan saat memuat model AI.',
+        );
       }
-    })();
+    };
+
+    initializeModels();
 
     return () => {
       isMountedRef.current = false;
-      if (rafIdRef.current) {
-        cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = null;
-      }
+
+      stopDetectionLoop();
+
       if (copyResetTimerRef.current) {
         clearTimeout(copyResetTimerRef.current);
       }
+
       cameraService.stopCamera();
       detectionService.dispose();
+
+      if (
+        typeof rootFactsService.dispose
+        === 'function'
+      ) {
+        rootFactsService.dispose();
+      }
     };
-    // Services are (re)created only on mount and on explicit retry.
-  }, [retryCount]);
+  }, [
+    retryCount,
+    stopDetectionLoop,
+  ]);
 
   return {
     state,
